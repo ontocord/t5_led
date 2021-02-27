@@ -440,16 +440,58 @@ class T5Attention(nn.Module):
         """
 
         batch_size, seq_length = hidden_states.shape[:2]
-
+        window_overlap = self.config.attention_window[layer_id]//2
+        chunks_count = seq_length // window_overlap - 1
         if position_bias is None:
             if not self.has_relative_attention_bias or not compute_relative_attention_bias:
                 position_bias = torch.zeros(
-                    (1, self.n_heads, seq_length, seq_lenth),  device=hidden_states.device, dtype=hidden_states.dtype
+                    (1, self.n_heads, seq_length, self.config.attention_window[layer_id]),  device=hidden_states.device, dtype=hidden_states.dtype
                 )
             else:
-                position_bias = self.compute_bias(seq_length, seq_length,  False)  # (batch_size, n_heads, seq_length, key_length) 
-            position_bias = position_bias.permute(0, 2, 1, 3) 
-            print ("ccompute bias 2", position_bias.size())
+                relative_position = torch.tensor([[i-window_overlap for i in range(2*window_overlap+1)]])
+                relative_position_bucket = self._relative_position_bucket(
+                    relative_position,  # shape (query_length, key_length)
+                    bidirectional=True,
+                    num_buckets=self.relative_attention_num_buckets,
+                )
+                relative_position_bucket = relative_position_bucket.to(self.relative_attention_bias.weight.device)
+                values = self.relative_attention_bias(relative_position_bucket)  # shape (query_length, key_length, num_heads)
+                position_bias = values.permute([0, 2, 1]).unsqueeze(0)  # shape (1, num_heads, query_length, key_length)
+                if False:
+                    position_bias = self.compute_bias(seq_length, seq_length,  False)  # (batch_size, n_heads, seq_length, key_length)  self.config.attention_window[layer_id]
+            #print ("position_bias", position_bias.size(), position_bias)
+            if False:
+                position_bias = F.pad(position_bias, (0, 1), value=-10000)
+                position_bias = position_bias.reshape(batch_size * self.n_heads, seq_length, -1).unsqueeze(1)
+                position_bias2 = position_bias.new_empty(
+                    (batch_size * self.n_heads, chunks_count + 1, window_overlap, window_overlap * 2 + 1)
+                    )
+
+                # copy parts from position_bias into the combined matrix of position_bias
+                # - copying the main diagonal and the upper triangle
+                position_bias2[:, :-1, :, window_overlap:] = position_bias[
+                    :, :, :window_overlap, : window_overlap + 1
+                ]
+                position_bias2[:, -1, :, window_overlap:] = position_bias[
+                    :, -1, window_overlap:, : window_overlap + 1
+                ]
+                # - copying the lower triangle
+                position_bias2[:, 1:, :, :window_overlap] = position_bias[
+                    :, :, -(window_overlap + 1) : -1, window_overlap + 1 :
+                ]
+
+                position_bias2[:, 0, 1:window_overlap, 1:window_overlap] = position_bias[
+                    :, 0, : window_overlap - 1, 1 - window_overlap :
+                ]
+
+                # separate batch_size and n_heads dimensions again
+                position_bias2 = position_bias2.view(
+                    batch_size, self.n_heads, seq_length, 2 * window_overlap + 1
+                ).transpose(2, 1)
+
+                self._mask_invalid_locations(position_bias2, window_overlap)
+                position_bias = position_bias2
+                #print ("position bias", position_bias.size(),  position_bias)
 
         hidden_states = hidden_states.transpose(0, 1)
         if query_states is None:
@@ -469,7 +511,7 @@ class T5Attention(nn.Module):
         ), f"hidden_states should have embed_dim = {self.embed_dim}, but has {embed_dim}"
 
         # normalize query - T5 does not do the sqrt
-        query_vectors /= math.sqrt(self.key_value_proj_dim)
+        #query_vectors /= math.sqrt(self.key_value_proj_dim)
 
         query_vectors = query_vectors.view(seq_len, batch_size, self.n_heads, self.key_value_proj_dim).transpose(0, 1)
         key_vectors = key_vectors.view(seq_len, batch_size, self.n_heads, self.key_value_proj_dim).transpose(0, 1)
@@ -479,26 +521,27 @@ class T5Attention(nn.Module):
         )
 
         # values to pad for attention probs
-        print ("mask", mask.size())
+        #print ("mask", mask.size())
         remove_from_windowed_mask = (mask != 0)[:, :, None, None]
 
         # cast to fp32/fp16 then replace 1's with -inf
         float_mask = remove_from_windowed_mask.type_as(query_vectors).masked_fill(
-            remove_from_windowed_mask, -10000.0
+            remove_from_windowed_mask, -10000 # -10000.0
         )
+
+        #position_bias2 = self._sliding_chunks_query_key_matmul(
+        #    position_bias.new_ones(size=position_bias.size()), position_bias, self.one_sided_attn_window_size
+        #)
+        #position_bias2 = position_bias[:, :, :, :attn_scores.size()[-1]]
+        #print ("position_bias2", position_bias2.size(), position_bias2)
+
         # diagonal mask with zeros everywhere and -inf inplace of padding
-        
-        position_bias2 = self._sliding_chunks_query_key_matmul(
-            position_bias.new_ones(size=position_bias.size()), position_bias, self.one_sided_attn_window_size
-        )
-        print ("position_bias2", position_bias2.size())
         diagonal_mask = self._sliding_chunks_query_key_matmul(
             float_mask.new_ones(size=float_mask.size()), float_mask, self.one_sided_attn_window_size
         )
 
-        print ("doing diagnoal ", diagonal_mask.size(), float_mask.size(), attn_scores.size(), query_vectors.size())
-        # pad local attention probs
-        attn_scores += diagonal_mask + position_bias2
+        #print ("adding attn_scores with mask and bias ", attn_scores.size(), diagonal_mask.size(), position_bias.size())
+        attn_scores += diagonal_mask + position_bias
 
         assert list(attn_scores.size()) == [
             batch_size,
@@ -536,8 +579,9 @@ class T5Attention(nn.Module):
         if False: # position_bias is not None:
             # we need to account for the position_bias for the global parameters??
             pass
+
         attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
-        print ("attn_probs", attn_probs.size())
+        #print ("attn_probs", attn_probs.size(), attn_probs)
         if layer_head_mask is not None:
             assert layer_head_mask.size() == (
                 self.n_heads,
@@ -545,22 +589,22 @@ class T5Attention(nn.Module):
             attn_probs = layer_head_mask.view(1, 1, -1, 1) * attn_probs
 
         # softmax sometimes inserts NaN if all positions are masked, replace them with 0
-        print ("is_index_mask", is_index_masked.size())
+        #print ("is_index_mask", is_index_masked.size())
         attn_probs = torch.masked_fill(attn_probs, is_index_masked[:, :attn_probs.size()[1], None, None], 0.0)
         attn_probs = attn_probs.type_as(attn_scores)
-        print ("attn_probs", attn_probs.size())
+
         # free memory
         del attn_scores
 
         # apply dropout
         attn_probs = F.dropout(attn_probs, p=self.dropout, training=self.training)
 
-        print ("attn_probs", attn_probs.size(), attn_probs)
+        #print ("attn_probs", attn_probs.size(), attn_probs)
         value_vectors = value_vectors.view(seq_len, batch_size, self.n_heads, self.key_value_proj_dim).transpose(0, 1)
 
         # compute local attention output with global attention value and add
         if is_global_attn:
-            print ("got 1")
+            #print ("got 1")
             # compute sum of global and local attn
             attn_output = self._compute_attn_output_with_global_indices(
                 value_vectors=value_vectors,
@@ -570,7 +614,7 @@ class T5Attention(nn.Module):
                 is_local_index_global_attn_nonzero=is_local_index_global_attn_nonzero,
             )
         else:
-            print ("got 2")
+            #print ("got 2")
             # compute local attn only
             attn_output = self._sliding_chunks_matmul_attn_probs_value(
                 attn_probs, value_vectors, self.one_sided_attn_window_size
@@ -582,7 +626,7 @@ class T5Attention(nn.Module):
         # compute value for global attention and overwrite to attention output
         # TODO: remove the redundant computation
         if is_global_attn:
-            print ("got 3")
+            #print ("got 3")
             global_attn_output, global_attn_probs = self._compute_global_attn_output_from_hidden(
                 hidden_states=hidden_states,
                 max_num_global_attn_indices=max_num_global_attn_indices,
@@ -592,13 +636,13 @@ class T5Attention(nn.Module):
                 is_local_index_no_global_attn_nonzero=is_local_index_no_global_attn_nonzero,
                 is_index_masked=is_index_masked,
             )
-            print ("got 4")
+            #print ("got 4")
             # get only non zero global attn output
             nonzero_global_attn_output = global_attn_output[
                 is_local_index_global_attn_nonzero[0], :, is_local_index_global_attn_nonzero[1]
             ]
 
-            print ("got 5")
+            #print ("got 5")
             # overwrite values with global attention
             attn_output[is_index_global_attn_nonzero[::-1]] = nonzero_global_attn_output.view(
                 len(is_local_index_global_attn_nonzero[0]), -1
@@ -609,9 +653,9 @@ class T5Attention(nn.Module):
             attn_probs[is_index_global_attn_nonzero] = 0
 
         attn_output = attn_output.transpose(0, 1)
-        print ("got 6", attn_output.size())
+        #print ("got 6", attn_output.size())
         attn_output = self.o(attn_output)
-        print ("got 7", attn_output.size())
+        #print ("got 7", attn_output.size())
         present_key_value_state = None
         outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
 
@@ -690,10 +734,10 @@ class T5Attention(nn.Module):
         ending_mask = beginning_mask.flip(dims=(1, 3))
         beginning_input = input_tensor[:, :affected_seq_len, :, : affected_seq_len + 1]
         beginning_mask = beginning_mask.expand(beginning_input.size())
-        beginning_input.masked_fill_(beginning_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
+        beginning_input.masked_fill_(beginning_mask == 1, -10000)  # `== 1` converts to bool or uint8
         ending_input = input_tensor[:, -affected_seq_len:, :, -(affected_seq_len + 1) :]
         ending_mask = ending_mask.expand(ending_input.size())
-        ending_input.masked_fill_(ending_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
+        ending_input.masked_fill_(ending_mask == 1, -10000)  # `== 1` converts to bool or uint8
 
     def _sliding_chunks_query_key_matmul(self, query: torch.Tensor, key: torch.Tensor, window_overlap: int):
         """
@@ -701,7 +745,7 @@ class T5Attention(nn.Module):
         implementation splits the input into overlapping chunks of size 2w (e.g. 512 for pretrained LEDEncoder) with an
         overlap of size window_overlap
         """
-        print ("sliding_chunks query_key", query.size())
+        #print ("sliding_chunks query_key", query.size())
         batch_size, seq_len, n_heads, key_value_proj_dim = query.size()
         assert (
             seq_len % (window_overlap * 2) == 0
@@ -721,11 +765,13 @@ class T5Attention(nn.Module):
         # bcyd: batch_size * n_heads x chunks x 2window_overlap x key_value_proj_dim
         # bcxy: batch_size * n_heads x chunks x 2window_overlap x window_overlap
         diagonal_chunked_attention_scores = torch.einsum("bcxd,bcyd->bcxy", (query, key))  # multiply
-
+        
         # convert diagonals into columns
         diagonal_chunked_attention_scores = self._pad_and_transpose_last_two_dims(
             diagonal_chunked_attention_scores, padding=(0, 0, 0, 1)
         )
+        #print ("diagonal_chunked_attention_scores", diagonal_chunked_attention_scores.size(), diagonal_chunked_attention_scores)
+        # add the position_bias here
 
         # allocate space for the overall attention matrix where the chunks are combined. The last dimension
         # has (window_overlap * 2 + 1) columns. The first (window_overlap) columns are the window_overlap lower triangles (attention from a word to
@@ -768,7 +814,7 @@ class T5Attention(nn.Module):
         Same as _sliding_chunks_query_key_matmul but for attn_probs and value tensors. Returned tensor will be of the
         same shape as `attn_probs`
         """
-        print ("sliding chunks attn proobs", value.size())
+        #print ("sliding chunks attn proobs", value.size())
         batch_size, seq_len, n_heads, key_value_proj_dim = value.size()
 
         assert seq_len % (window_overlap * 2) == 0
@@ -855,7 +901,7 @@ class T5Attention(nn.Module):
 
         attn_probs_from_global_key[
             is_local_index_no_global_attn_nonzero[0], :, :, is_local_index_no_global_attn_nonzero[1]
-        ] = -10000.0
+        ] = -10000 # -10000.0
 
         return attn_probs_from_global_key
 
@@ -913,14 +959,14 @@ class T5Attention(nn.Module):
         global_attn_hidden_states[is_local_index_global_attn_nonzero[::-1]] = hidden_states[
             is_index_global_attn_nonzero[::-1]
         ]
-        print ("_compute_global_attn_output_from_hidden 1")
+        #print ("_compute_global_attn_output_from_hidden 1")
         # global key, query, value
         global_query_vectors_only_global = self.q_global(global_attn_hidden_states)
         global_key_vectors = self.k_global(hidden_states)
         global_value_vectors = self.v_global(hidden_states)
 
         # normalize - T5 does not do the sqrt
-        global_query_vectors_only_global /= math.sqrt(self.key_value_proj_dim)
+        #global_query_vectors_only_global /= math.sqrt(self.key_value_proj_dim)
 
         # reshape
         global_query_vectors_only_global = (
@@ -935,7 +981,7 @@ class T5Attention(nn.Module):
             global_value_vectors.contiguous().view(-1, batch_size * self.n_heads, self.key_value_proj_dim).transpose(0, 1)
         )  # batch_size * self.n_heads, seq_len, key_value_proj_dim)
 
-        print ("_compute_global_attn_output_from_hidden 2")
+        #print ("_compute_global_attn_output_from_hidden 2")
         # compute attn scores
         global_attn_scores = torch.bmm(global_query_vectors_only_global, global_key_vectors.transpose(1, 2))
 
@@ -949,16 +995,16 @@ class T5Attention(nn.Module):
 
         global_attn_scores[
             is_local_index_no_global_attn_nonzero[0], :, is_local_index_no_global_attn_nonzero[1], :
-        ] = -10000.0
-        print ("_compute_global_attn_output_from_hidden 3", global_attn_scores.size(), is_index_masked.size())
+        ] = -10000 # -10000.0
+        #print ("_compute_global_attn_output_from_hidden 3", global_attn_scores.size(), is_index_masked.size())
         global_attn_scores = global_attn_scores.masked_fill(
             is_index_masked[:, None, None, :global_attn_scores.size()[3]],
-            -10000.0,
+            -10000, # -10000.0,
         )
 
         global_attn_scores = global_attn_scores.view(batch_size * self.n_heads, max_num_global_attn_indices, seq_len)
 
-        print ("_compute_global_attn_output_from_hidden 4")
+        #print ("_compute_global_attn_output_from_hidden 4")
         # compute global attn probs
         global_attn_probs_float = F.softmax(
             global_attn_scores, dim=-1, dtype=torch.float32
@@ -1024,7 +1070,7 @@ class T5Attention(nn.Module):
         # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
         # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
         batch_size, seq_length = hidden_states.shape[:2]
-        if not is_decoder and key_value_states is None and seq_length >= self.config.attention_window[layer_id]:
+        if  not is_decoder and key_value_states is None and seq_length >= self.config.attention_window[layer_id]:
             return self.forward_long(hidden_states, 
                                      mask=mask, 
                                      position_bias=position_bias, 
@@ -1098,7 +1144,7 @@ class T5Attention(nn.Module):
 
         if position_bias is None:
             if not self.has_relative_attention_bias:
-                print ("zero position bias")
+                #print ("zero position bias")
                 position_bias = torch.zeros(
                     (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
                 )
@@ -1112,11 +1158,12 @@ class T5Attention(nn.Module):
 
             if mask is not None:
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
-            print ("position_bias" , position_bias.size())
+            #print ("position_bias" , position_bias.size(), position_bias)
         scores += position_bias
         attn_weights = F.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (batch_size, n_heads, seq_length, key_length)
+        #print ("attn_probs", attn_weights.size(), attn_weights)
         attn_weights = F.dropout(
             attn_weights, p=self.dropout, training=self.training
         )  # (batch_size, n_heads, seq_length, key_length)
@@ -1631,7 +1678,7 @@ class T5Stack(T5PreTrainedModel):
         do_long_former = (not is_decoder) and seq_length >= min(self.config.attention_window)
         if do_long_former:
             # pad input if necessary
-            print ("padding")
+            #print ("padding")
             padding_len, input_ids, attention_mask, inputs_embeds = self._pad_to_window_size(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1684,11 +1731,11 @@ class T5Stack(T5PreTrainedModel):
 
         hidden_states = self.dropout(inputs_embeds)
         
-        print ("first", hidden_states.size())
+        #print ("first", hidden_states.size())
         position_bias = None
 
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
-            print ("layer", i)
+            #print ("layer", i)
             layer_head_mask = head_mask[i]
             encoder_layer_head_mask = encoder_head_mask[i]
             # Model parallel
@@ -1766,7 +1813,7 @@ class T5Stack(T5PreTrainedModel):
         if padding_len > 0:
             # unpad `hidden_states` because the calling function is expecting a length == input_ids.size(1)
             hidden_states = hidden_states[:, :-padding_len]
-        print ("final hidden_states", hidden_states.size())
+        #print ("final hidden_states", hidden_states.size())
         # Add last layer
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -2519,7 +2566,7 @@ if __name__ == "__main__":
         tokenizer.model_max_length=1000000000
         #print (tokenizer)
         p = pipelines.pipeline("text2text-generation", model=model, tokenizer=tokenizer, device=0)
-        print (p("""question: Where was Lincoln born? context: 
+        print (p("""question: Who hated Lincoln? context: 
 Abraham Lincoln (/ˈlɪŋkən/; February 12, 1809 – April 15, 1865) was an American statesman and lawyer who served as the 16th president of the United States from 1861 until his assassination in 1865. Lincoln led the nation through the American Civil War, the country's greatest moral, constitutional, and political crisis. He succeeded in preserving the Union, abolishing slavery, bolstering the federal government, and modernizing the U.S. economy.
 
 Lincoln was born into poverty in a log cabin and was raised on the frontier primarily in Indiana. He was self-educated and became a lawyer, Whig Party leader, Illinois state legislator, and U.S. Congressman from Illinois. In 1849, he returned to his law practice but became vexed by the opening of additional lands to slavery as a result of the Kansas–Nebraska Act. He reentered politics in 1854, becoming a leader in the new Republican Party, and he reached a national audience in the 1858 debates against Stephen Douglas. Lincoln ran for President in 1860, sweeping the North in victory. Pro-slavery elements in the South equated his success with the North's rejection of their right to practice slavery, and southern states began seceding from the union. To secure its independence, the new Confederate States fired on Fort Sumter, a U.S. fort in the South, and Lincoln called up forces to suppress the rebellion and restore the Union.
