@@ -1352,11 +1352,10 @@ class T5PreTrainedModel(PreTrainedModel):
         super().__init__(config)
         self.config = config
         if not hasattr(config, "attention_window"):
-            if not hasattr(config, "attention_window") or isinstance(self.config.attention_window, int):
+            if not hasattr(config, "attention_window"):
                 config.attention_window = [512]*config.num_layers
-            else:
+            elif  isinstance(self.config.attention_window, int)
                 config.attention_window = [config.attention_window]*config.num_layers
-            config.attention_window = [512]*config.num_layers
             if False:
                 if config.num_layers > 3 and config.num_layers >= 6:
                     config.attention_window[0] = 64
@@ -1686,15 +1685,7 @@ class T5Stack(T5PreTrainedModel):
         hidden_states = self.dropout(inputs_embeds)
         
         print ("first", hidden_states.size())
-        if False: # position_bias is None:
-            for layer_module in self.block:
-                if layer_module.layer[0].SelfAttention.has_relative_attention_bias:
-                    position_bias = layer_module.layer[0].SelfAttention.compute_bias(hidden_states.size()[1], hidden_states.size()[1], False)
-                    print ("computing bias", position_bias.size())
-                # position_bias is (batch_size, n_heads, seq_length, key_length)
-                    break
-        if True:
-            position_bias = None
+        position_bias = None
 
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
             print ("layer", i)
@@ -1721,28 +1712,10 @@ class T5Stack(T5PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if False:
-                seq_length2 = hidden_states.size()[1]
-                if do_long_former:
-                    attention_window = self.config.attention_window[i]
-                    seq_length2 = math.ceil(seq_length/attention_window)*attention_window
-                    if hidden_states.size()[1] > seq_length2:
-                        hidden_states2 = hidden_states[:, :seq_length2]
-                        extended_attention_mask2 =  extended_attention_mask[:, :seq_length2,]
-                        position_bias2 = position_bias[:, :, :seq_length2,]
-                    else:
-                        hidden_states2 = hidden_states
-                        extended_attention_mask2 = extended_attention_mask
-                        position_bias2 = position_bias
-                else:
-                    pass
-            hidden_states2 = hidden_states
-            extended_attention_mask2 = extended_attention_mask
-            position_bias2 = position_bias
             layer_outputs = layer_module(
-                hidden_states, # 2
-                attention_mask=extended_attention_mask, # 2
-                position_bias=position_bias, # 2
+                hidden_states, 
+                attention_mask=extended_attention_mask, 
+                position_bias=position_bias, 
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_extended_attention_mask,
                 encoder_decoder_position_bias=encoder_decoder_position_bias,
@@ -1762,9 +1735,6 @@ class T5Stack(T5PreTrainedModel):
             # layer_outputs is a tuple with:
             # hidden-states, key-value-states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
             hidden_states, present_key_value_state = layer_outputs[:2]
-            if False:
-                if do_long_former and hidden_states.size()[1] > seq_length2:
-                    hidden_states[:, :seq_length2] = hidden_states2
 
             # We share the position biases between the layers - the first layer store them
             # layer_outputs = hidden-states, key-value-states (self-attention weights),
