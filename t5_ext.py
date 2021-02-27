@@ -1354,7 +1354,7 @@ class T5PreTrainedModel(PreTrainedModel):
         if not hasattr(config, "attention_window"):
             if not hasattr(config, "attention_window"):
                 config.attention_window = [512]*config.num_layers
-            elif  isinstance(self.config.attention_window, int)
+            elif  isinstance(self.config.attention_window, int):
                 config.attention_window = [config.attention_window]*config.num_layers
             if False:
                 if config.num_layers > 3 and config.num_layers >= 6:
